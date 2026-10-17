@@ -26,7 +26,10 @@
   };
 
   // ---------- State ----------
+  const DEFAULT_SETTINGS = { shuffle: false, repeat: 'off', volume: 1 };
   const state = {
+    user: null,
+    allowSignups: true,
     tracks: [],
     queue: [],
     qi: -1,
@@ -34,19 +37,33 @@
   };
   const audio = new Audio();
   audio.preload = 'auto';
-  let audioUrl = null;
-  const artUrls = new Map();
 
   function loadSettings() {
-    const defaults = { shuffle: false, repeat: 'off', volume: 1 };
     try {
-      return { ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY)) };
+      return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY)) };
     } catch {
-      return defaults;
+      return { ...DEFAULT_SETTINGS };
     }
   }
+
+  // Preferences are cached locally and synced to the account, batched so dragging a color doesn't flood the server.
+  const pendingPrefs = {};
+  let prefsTimer;
+  function syncPrefs(part) {
+    if (!state.user) return;
+    Object.assign(pendingPrefs, part);
+    clearTimeout(prefsTimer);
+    prefsTimer = setTimeout(() => {
+      const body = { ...pendingPrefs };
+      for (const k of Object.keys(pendingPrefs)) delete pendingPrefs[k];
+      API.savePrefs(body).catch(() => toast("Couldn't save your settings"));
+    }, 600);
+  }
+  Theme.onChange(theme => syncPrefs({ theme }));
+
   function saveSettings() {
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch { /* ignore */ }
+    syncPrefs({ settings: state.settings });
   }
   audio.volume = state.settings.volume;
 
@@ -55,7 +72,6 @@
   const byText = (a, b) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true });
   const artistOf = t => t.artist || UNKNOWN_ARTIST;
   const albumOf = t => t.album || UNKNOWN_ALBUM;
-  const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
 
   function fmtTime(sec) {
     if (!isFinite(sec) || sec < 0) sec = 0;
@@ -81,11 +97,7 @@
   }
   const unique = arr => [...new Set(arr)].sort(byText);
 
-  function artUrl(track) {
-    if (!track.art) return null;
-    if (!artUrls.has(track.id)) artUrls.set(track.id, URL.createObjectURL(track.art));
-    return artUrls.get(track.id);
-  }
+  const artUrl = track => (track.hasArt ? API.artUrl(track.id) : null);
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -122,9 +134,7 @@
   function load(autoplay) {
     const t = current();
     if (!t) return stop();
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-    audioUrl = URL.createObjectURL(t.blob);
-    audio.src = audioUrl;
+    audio.src = API.audioUrl(t.id);
     if (autoplay) audio.play().catch(() => updateIndicators());
     updateMediaSession();
     refreshPlayingViews();
@@ -134,8 +144,6 @@
     audio.pause();
     audio.removeAttribute('src');
     audio.load();
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-    audioUrl = null;
     state.queue = [];
     state.qi = -1;
     updateIndicators();
@@ -202,7 +210,7 @@
       title: t.title,
       artist: artistOf(t),
       album: albumOf(t),
-      artwork: art ? [{ src: art, sizes: '512x512', type: t.art.type }] : [],
+      artwork: art ? [{ src: new URL(art, location.href).href, sizes: '512x512' }] : [],
     });
   }
   if ('mediaSession' in navigator) {
@@ -283,36 +291,37 @@
     if (!files.length) return toast('No audio files found');
     let added = 0;
     let failed = 0;
+    let lastError = '';
     for (const [i, file] of files.entries()) {
-      toast(`Adding ${i + 1} of ${files.length}…`, 0);
+      const label = `Uploading ${i + 1} of ${files.length}`;
+      toast(`${label}…`, 0);
       const duration = await probeDuration(file);
-      if (duration === null) { failed++; continue; }
+      if (duration === null) { failed++; lastError = "Your browser can't play that format"; continue; }
       const tags = await ID3.parse(file);
       const fromName = metaFromName(file.name);
-      const track = {
-        id: uid(),
+      const form = new FormData();
+      form.append('meta', JSON.stringify({
         title: tags.title || fromName.title,
         artist: tags.artist || fromName.artist,
         album: tags.album || '',
         track: tags.track,
         duration,
-        art: tags.art || null,
-        blob: new Blob([file], { type: file.type || 'audio/mpeg' }),
-        size: file.size,
-        fileName: file.name,
-        added: Date.now(),
-      };
+      }));
+      form.append('audio', file, file.name);
+      if (tags.art) form.append('art', tags.art, 'cover');
       try {
-        await DB.put(track);
+        const track = await API.upload(form, p => toast(`${label}… ${Math.round(p * 100)}%`, 0));
         state.tracks.push(track);
         added++;
       } catch (e) {
-        console.error(e);
         failed++;
-        if (e && e.name === 'QuotaExceededError') { toast('Storage is full'); break; }
+        lastError = e.message;
+        if (e.status === 401 || e.status === 0) break;
+        if (e.status === 413 && /storage/i.test(e.message)) break;
       }
     }
-    toast(`Added ${added} track${added === 1 ? '' : 's'}${failed ? ` · ${failed} couldn't be added` : ''}`, 3000);
+    const summary = `Added ${added} track${added === 1 ? '' : 's'}`;
+    toast(failed ? `${summary} · ${failed} failed: ${lastError}` : summary, failed ? 5000 : 3000);
     rerender();
   }
 
@@ -343,14 +352,21 @@
   async function deleteTracks(ids) {
     const set = new Set(ids);
     if (current() && set.has(current().id)) stop();
-    for (const id of ids) {
-      await DB.remove(id);
-      if (artUrls.has(id)) { URL.revokeObjectURL(artUrls.get(id)); artUrls.delete(id); }
+    const removed = new Set();
+    try {
+      for (const id of ids) {
+        await API.remove(id);
+        removed.add(id);
+      }
+    } catch (e) {
+      toast(e.message);
     }
+    set.forEach(id => removed.has(id) || set.delete(id));
     state.tracks = state.tracks.filter(t => !set.has(t.id));
     const cur = state.queue[state.qi];
     state.queue = state.queue.filter(id => !set.has(id));
     state.qi = state.queue.indexOf(cur);
+    return set.size;
   }
 
   // ---------- Theme color picking ----------
@@ -409,6 +425,103 @@
   const emptyLibrary = () => [{ label: 'Add Tracks…', action: pickFiles }];
 
   const screens = {
+    loading: () => ({ title: 'iPod', render: view => { view.innerHTML = '<div class="message">Loading…</div>'; } }),
+
+    offline: () => ({
+      title: 'iPod',
+      message: "Can't reach the server. Check your connection.",
+      items: [{ label: 'Try Again', chevron: false, action: boot }],
+    }),
+
+    welcome: () => ({
+      title: 'iPod',
+      message: 'Sign in to play your music on any device.',
+      items: [
+        { label: 'Sign In', to: ['signIn'] },
+        state.allowSignups && { label: 'Create Account', to: ['signUp'] },
+      ],
+    }),
+
+    signIn: () => ({
+      title: 'Sign In',
+      form: {
+        fields: [
+          { name: 'username', label: 'Username', autocomplete: 'username' },
+          { name: 'password', label: 'Password', type: 'password', autocomplete: 'current-password' },
+        ],
+        submit: 'Sign In',
+        onSubmit: async v => signedIn(await API.login(v.username.trim(), v.password)),
+      },
+    }),
+
+    signUp: () => ({
+      title: 'Create Account',
+      form: {
+        fields: [
+          { name: 'username', label: 'Username', autocomplete: 'username' },
+          { name: 'password', label: 'Password', type: 'password', autocomplete: 'new-password' },
+          { name: 'confirm', label: 'Confirm Password', type: 'password', autocomplete: 'new-password' },
+        ],
+        hint: '3–32 letters or numbers. Password of at least 8 characters.',
+        submit: 'Create Account',
+        onSubmit: async v => {
+          if (v.password !== v.confirm) throw new Error("Passwords don't match");
+          signedIn(await API.signup(v.username.trim(), v.password));
+        },
+      },
+    }),
+
+    account: () => ({
+      title: 'Account',
+      items: [
+        { label: 'Username', value: state.user.username, chevron: false },
+        { label: 'Change Password', to: ['changePassword'] },
+        { label: 'Sign Out', to: ['confirm', {
+          title: 'Sign Out',
+          message: 'Sign out of this device? Your music stays in your account.',
+          confirm: 'Sign Out',
+          onConfirm: async () => {
+            await API.logout().catch(() => {});
+            signedOut();
+          },
+        }] },
+        { label: 'Delete Account', to: ['deleteAccount'] },
+      ],
+    }),
+
+    changePassword: () => ({
+      title: 'Change Password',
+      form: {
+        fields: [
+          { name: 'current', label: 'Current Password', type: 'password', autocomplete: 'current-password' },
+          { name: 'next', label: 'New Password', type: 'password', autocomplete: 'new-password' },
+          { name: 'confirm', label: 'Confirm New Password', type: 'password', autocomplete: 'new-password' },
+        ],
+        hint: 'Other devices will be signed out.',
+        submit: 'Change Password',
+        onSubmit: async v => {
+          if (v.next !== v.confirm) throw new Error("Passwords don't match");
+          await API.changePassword(v.current, v.next);
+          toast('Password changed');
+          back();
+        },
+      },
+    }),
+
+    deleteAccount: () => ({
+      title: 'Delete Account',
+      form: {
+        hint: `This permanently deletes your account and all ${state.tracks.length} of your tracks.`,
+        fields: [{ name: 'password', label: 'Password', type: 'password', autocomplete: 'current-password' }],
+        submit: 'Delete Account',
+        onSubmit: async v => {
+          await API.deleteAccount(v.password);
+          signedOut();
+          toast('Account deleted');
+        },
+      },
+    }),
+
     main: () => ({
       title: 'iPod',
       items: [
@@ -489,6 +602,7 @@
     settings: () => ({
       title: 'Settings',
       items: [
+        { label: 'Account', to: ['account'] },
         { label: 'Theme', to: ['theme'] },
         { label: 'Shuffle', value: state.settings.shuffle ? 'Songs' : 'Off', action: () => { state.settings.shuffle = !state.settings.shuffle; saveSettings(); rerender(); } },
         { label: 'Repeat', value: { off: 'Off', one: 'One', all: 'All' }[state.settings.repeat], action: () => {
@@ -562,7 +676,7 @@
           title: 'Delete All',
           message: `Delete all ${state.tracks.length} tracks from this device?`,
           confirm: 'Delete All',
-          onConfirm: async () => { await deleteTracks(state.tracks.map(t => t.id)); toast('Library cleared'); },
+          onConfirm: async () => { if (await deleteTracks(state.tracks.map(t => t.id))) toast('Library cleared'); },
         }] },
       ],
     }),
@@ -578,7 +692,7 @@
             title: 'Delete Track',
             message: `Delete “${t.title}”?`,
             confirm: 'Delete',
-            onConfirm: async () => { await deleteTracks([t.id]); toast('Track deleted'); },
+            onConfirm: async () => { if (await deleteTracks([t.id])) toast('Track deleted'); },
           }],
         })) : [{ label: 'No tracks', disabled: true, chevron: false }],
       };
@@ -611,9 +725,17 @@
   };
 
   // ---------- Navigation & rendering ----------
-  const stack = [{ id: 'main', args: {}, sel: 0, scroll: 0 }];
+  const stack = [{ id: 'loading', args: {}, sel: 0, scroll: 0 }];
   let activeList = null; // { el, items, entry }
+  let activeForm = null;
   let np = null; // Now Playing element refs
+
+  // Replaces the whole navigation stack, e.g. after signing in or out.
+  function resetTo(id) {
+    stack.length = 0;
+    stack.push({ id, args: {}, sel: 0, scroll: 0 });
+    render(0);
+  }
 
   function push(id, args = {}) {
     saveScroll();
@@ -632,6 +754,7 @@
   }
 
   function rerender() {
+    if (activeForm) return; // don't wipe what the user is typing
     saveScroll();
     render(0);
   }
@@ -652,9 +775,11 @@
     const view = document.createElement('div');
     view.className = 'view';
     activeList = null;
+    activeForm = null;
     np = null;
 
     if (def.render) def.render(view);
+    else if (def.form) buildForm(view, def);
     else buildList(view, def, entry);
 
     const old = [...screenEl.children];
@@ -676,6 +801,47 @@
     }
     updateIndicators();
     updateProgress();
+  }
+
+  function buildForm(view, def) {
+    const { fields, hint, submit, onSubmit } = def.form;
+    const form = document.createElement('form');
+    form.className = 'form';
+    form.noValidate = true;
+    form.innerHTML =
+      (hint ? `<p class="form-hint">${esc(hint)}</p>` : '') +
+      fields.map(f => `
+        <label class="field">
+          <span>${esc(f.label)}</span>
+          <input name="${f.name}" type="${f.type || 'text'}" autocomplete="${f.autocomplete || 'off'}"
+            autocapitalize="off" autocorrect="off" spellcheck="false" required>
+        </label>`).join('') +
+      '<div class="form-error" role="alert"></div>' +
+      `<button type="submit" class="form-submit">${esc(submit)}</button>`;
+    const errorEl = form.querySelector('.form-error');
+    const button = form.querySelector('.form-submit');
+
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      const values = Object.fromEntries(new FormData(form));
+      if (fields.some(f => !values[f.name])) {
+        errorEl.textContent = 'Please fill in every field';
+        return;
+      }
+      errorEl.textContent = '';
+      button.disabled = true;
+      try {
+        await onSubmit(values);
+      } catch (err) {
+        errorEl.textContent = err.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    view.appendChild(form);
+    activeForm = form;
+    if (matchMedia('(pointer: fine)').matches) setTimeout(() => form.querySelector('input')?.focus(), 250);
   }
 
   function buildList(view, def, entry) {
@@ -867,16 +1033,51 @@
   }, { passive: true });
 
   // ---------- Boot ----------
-  async function boot() {
-    render(0);
-    try {
-      state.tracks = await DB.all();
-    } catch (e) {
-      console.error(e);
-      toast('Storage is unavailable in this browser');
+  async function signedIn(user) {
+    state.user = user;
+    const { theme, settings } = user.prefs || {};
+    // A brand new account keeps whatever theme was in use when it was created.
+    if (theme) Theme.load(theme);
+    else syncPrefs({ theme: Theme.values() });
+    if (settings) {
+      state.settings = { ...DEFAULT_SETTINGS, ...settings };
+      audio.volume = state.settings.volume;
+      try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch { /* ignore */ }
     }
-    rerender();
-    if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+    try {
+      state.tracks = await API.tracks();
+    } catch (e) {
+      state.tracks = [];
+      toast(e.message);
+    }
+    resetTo('main');
+  }
+
+  function signedOut() {
+    stop();
+    state.user = null;
+    state.tracks = [];
+    resetTo('welcome');
+  }
+
+  window.addEventListener('api:unauthorized', () => {
+    if (!state.user) return;
+    signedOut();
+    toast('You were signed out');
+  });
+
+  async function boot() {
+    resetTo('loading');
+    try {
+      state.allowSignups = (await API.config()).allowSignups;
+    } catch {
+      return resetTo('offline');
+    }
+    try {
+      await signedIn(await API.me());
+    } catch (e) {
+      resetTo(e.status === 0 ? 'offline' : 'welcome');
+    }
   }
   boot();
 

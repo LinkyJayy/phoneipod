@@ -110,8 +110,12 @@ const Theme = (() => {
     return out;
   }
 
-  function save() {
+  let listener = null;
+
+  // `notify` is false when the values came from the server, so they aren't sent straight back.
+  function save(notify = true) {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(values)); } catch { /* storage unavailable */ }
+    if (notify && listener) listener({ ...values });
   }
 
   function resolve(key) {
@@ -164,6 +168,13 @@ const Theme = (() => {
       apply();
     },
     apply,
+    values: () => ({ ...values }),
+    onChange(fn) { listener = fn; },
+    load(obj) {
+      values = sanitize(obj);
+      save(false);
+      apply();
+    },
   };
 })();
 

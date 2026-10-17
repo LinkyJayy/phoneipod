@@ -1,12 +1,12 @@
-// Caches the app shell so the player works offline. Music itself lives in IndexedDB.
-const CACHE = 'phoneipod-v1';
+// Caches the app shell. API calls (accounts, tracks) always go to the server.
+const CACHE = 'phoneipod-v2';
 const SHELL = [
   './',
   'index.html',
   'styles.css',
   'manifest.webmanifest',
   'icons/icon.svg',
-  'js/db.js',
+  'js/api.js',
   'js/id3.js',
   'js/theme.js',
   'js/app.js',
@@ -26,7 +26,8 @@ self.addEventListener('activate', e => {
 
 // Network first so updates show up, falling back to the cache when offline.
 self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET' || new URL(e.request.url).origin !== location.origin) return;
+  const url = new URL(e.request.url);
+  if (e.request.method !== 'GET' || url.origin !== location.origin || url.pathname.startsWith('/api/')) return;
   e.respondWith(
     fetch(e.request)
       .then(res => {
