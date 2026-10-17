@@ -1,0 +1,14 @@
+{
+  "name": "PhoneiPod",
+  "short_name": "iPod",
+  "description": "A local music player styled like the classic iPod menu.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#ffffff",
+  "theme_color": "#fefefe",
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#fefefe">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="iPod">
+  <title>PhoneiPod</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header id="titlebar">
+      <button id="back" class="back" aria-label="Back" hidden>
+        <svg viewBox="0 0 10 16" aria-hidden="true"><polyline points="8,2 2,8 8,14"/></svg>
+      </button>
+      <span id="play-indicator" class="play-indicator" aria-hidden="true"></span>
+      <h1 id="title">iPod</h1>
+      <span id="battery" class="battery" role="img" aria-label="Battery">
+        <span class="battery-body"><span class="battery-fill"></span></span><span class="battery-cap"></span>
+      </span>
+    </header>
+    <main id="screen"></main>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="volume" class="volume-overlay" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M3 9h4l5-4v14l-5-4H3z"/></svg>
+      <div class="volume-bar"><div class="volume-fill"></div></div>
+    </div>
+  </div>
+
+  <input id="file-input" type="file" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.oga,.opus,.flac,.webm" multiple hidden>
+  <input id="theme-input" type="file" accept="application/json,.json" hidden>
+  <input id="color-input" type="color" tabindex="-1" aria-hidden="true">
+
+  <script src="js/db.js"></script>
+  <script src="js/id3.js"></script>
+  <script src="js/theme.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
